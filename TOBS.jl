@@ -1,17 +1,13 @@
-using TopOpt, Parameters, Makie, ForwardDiff, Ipopt, Juniper
+using TopOpt, Parameters, Makie, FiniteDifferences, Ipopt, Juniper, JuMP, Statistics, Ferrite
 using TopOpt.TopOptProblems.InputOutput.INP.Parser: InpContent
 import GLMakie, Plots
-
+include("./utils.jl")
 # Nonconvex.NonconvexCore.show_residuals[] = true
 
 @with_kw mutable struct FEAparameters
-    quants::Int = 1 # number of problems
-    results::Any = Array{Any}(undef, quants)
-    simps::Any = Array{Any}(undef, quants)
-    V::Array{Real} = [0.5] # volume fraction
-    pos::Array{Int} = [3381] # Indices of nodes to apply concentrated force
-    meshSize::Tuple{Int, Int} = (160, 40) # Size of rectangular mesh
+    meshSize::Tuple{Int, Int} = (70, 30) # Size of rectangular mesh
     elementIDs::Array{Int} = [i for i in 1:prod(meshSize)] # Vector that lists nodeIDs
+    problem::Any = 0.0
 end
 
 FEAparams = FEAparameters()
@@ -19,117 +15,148 @@ nels = prod(FEAparams.meshSize)
 
 #
 
-    function quad(x,y,vec; pa = 1)
-        quad=zeros(y,x)
-        for iel in 1:length(vec)
-        # Line of current element
-        i=floor(Int32,(iel-1)/x)+1
-        # Column of current element
-        j=iel-floor(Int32,(iel-1)/x)*x
-        pa == 2 ? quad[y-i+1,j]=vec[iel] : quad[i,j]=vec[iel]
-        end
-        return quad'
-    end
-
-    function mshData(meshSize)
-        
-        # Create vector of (float, float) tuples with node coordinates for "node_coords"
-        # Supposes rectangular elements with unit sides staring at postition (0.0, 0.0)
-        # size = (x, y) = quantity of elements in each direction
-
-        coordinates = Array{Tuple{Float64, Float64}}(undef, (meshSize[1] + 1)*(meshSize[2] + 1))
-        for line in 1:(meshSize[2] + 1)
-            coordinates[(line + (line - 1)*meshSize[1]):(line*(1 + meshSize[1]))] .= [((col - 1)/1, (line - 1)/1) for col in 1:(meshSize[1] + 1)]
-        end
-
-        # Create vector of tuples of integers for "cells"
-        # Each line refers to a cell/element and lists its nodes in counter-clockwise order
-
-        g_num = Array{Tuple{Vararg{Int, 4}}, 1}(undef, prod(meshSize))
-        for elem in 1:prod(meshSize)
-            dd = floor(Int32, (elem - 1)/meshSize[1]) + elem
-            g_num[elem] = (dd, dd + 1, dd + meshSize[1] + 2, dd + meshSize[1] + 1)
-        end
-
-        return coordinates, g_num
-
-    end
-
     # nodeCoords = Vector of tuples with node coordinates
     # cells = Vector of tuples of integers. Each line refers to an element
     # and lists the IDs of its nodes
     nodeCoords, cells = mshData(FEAparams.meshSize)
     # Type of element (CPS4 = linear quadrilateral)
     cellType = "CPS4"
+    # toy grid
+    grid = generate_grid(Quadrilateral, FEAparams.meshSize)
+    numCellNodes = length(grid.cells[1].nodes) # number of nodes per cell/element
+    # integer matrix representing displacement boundary conditions (supports):
+    # 0: free element
+    # 1: element restricted in the x direction ("roller")
+    # 2: element restricted in the y direction ("roller")
+    # 3: element restricted in both directions ("pinned"/"clamped")
+    dispBC = zeros(Int, (3,3))
+    
     # Dictionary mapping strings to vectors of integers. The vector groups node IDs that can be later
         # referenced by the name in the string
-    # nodeSets = Dict("supps" => rand(FEAparams.elementIDs, 4))
-    # nodeSets = Dict("supps" => [1, 64, 123, 190, 260, 489])
     # Clamp left boundary of rectangular domain
-    nodeSets = Dict("supps" => findall([iszero.(nodeCoords[node])[1] for node in 1:size(nodeCoords)[1]]))
+    nodeSets, dispBC = simplePins!("left", dispBC, FEAparams)
     # Similar to nodeSets, but refers to groups of cells (FEA elements) 
     cellSets = Dict(
         "SolidMaterialSolid" => FEAparams.elementIDs,
         "Eall"               => FEAparams.elementIDs,
-        "Evolumes"           => FEAparams.elementIDs)
-    # Young's modulus
-    E = 1.0
-    # Poisson's ratio
-    ν = 0.3
-    # Material's physical density
-    density = 0.0
+        "Evolumes"           => FEAparams.elementIDs
+    )
     # Dictionary mapping strings to vectors of tuples of Int and Float. The string contains a name. It refers to
         # a group of nodes defined in nodeSets. The tuples inform the displacement (Float) applied to a
         # a certain DOF (Int) of the nodes in that group. This is used to apply
         # Dirichlet boundary conditions.
     nodeDbcs = Dict("supps" => [(1, 0.0), (2, 0.0)])
+    # lpos has the IDs of the loaded nodes.
+    # each line in "forces" contains [forceLine forceCol forceXcomponent forceYcomponent]
+    # lpos, forces = loadPos(nels, dispBC, FEAparams, grid)
+    lpos = [709 710 781 780 1420 1419 1491 1490]
+    forces = [
+        21 70 1.0 1.0
+        11 70 1.0 1.0
+    ]
     # Dictionary mapping integers to vectors of floats. The vector
-        # represents a force applied to the node with the integer ID.
-    cLoads = Dict(FEAparams.pos[1] => [0.0, -1])
-    # Similar to nodeSets, but groups faces of cells (elements)
-    faceSets = Dict("uselessFaces" => [(1,1)])
-    # Dictionary mapping strings to floats. The string refers to a group of cell faces
-        # (element faces (or sides?)) defined in faceSets. The float is the value of a traction
-        # applied to the faces inside that group.
-    dLoads = Dict("uselessFaces" => 0.0)
+    # represents a force applied to the node with
+    # the respective integer ID.
+    cLoads = Dict(lpos[1] => forces[1,3:4])
+    [merge!(cLoads, Dict(lpos[c] => forces[1,3:4])) for c in 2:numCellNodes];
+    if length(lpos) > numCellNodes+1
+        for pos in (numCellNodes+1):length(lpos)
+            pos == (numCellNodes+1) && (global ll = 2)
+            merge!(cLoads, Dict(lpos[pos] => forces[ll,3:4]))
+            pos % numCellNodes == 0 && (global ll += 1)
+        end
+    end
 
     # Create struct with FEA input data
-    inpCont = InpContent(nodeCoords, cellType, cells, nodeSets, cellSets, E, ν,
-    density, nodeDbcs, cLoads, faceSets, dLoads)
-
-    problem = InpStiffness(inpCont; keep_load_cells=false)
+    FEAparams.problem = InpStiffness(InpContent(nodeCoords, cellType, cells, nodeSets, cellSets, 1.0, 0.3,
+    0.0, nodeDbcs, cLoads, Dict("uselessFaces" => [(1,1)]), Dict("uselessFaces" => 0.0)))
 
 #
 
-sensPast = zeros(solver.vars)
-while true
-    #######   FEA
+# function TOBS(FEAparams, VF)
+    VF = 0.7
+    nl_solver = optimizer_with_attributes(Ipopt.Optimizer, "print_level"=>1)
+    minlp_solver = optimizer_with_attributes(Juniper.Optimizer, "nl_solver"=>nl_solver)
+    solver = FEASolver(Direct, FEAparams.problem; xmin=1e-6, penalty=TopOpt.PowerPenalty(3.0)) # instancing of FEA solver
+    numVars = length(solver.vars)
+    @show numVars
+    β = 0.05 # parameter that limits volume change per iteration
+    count = 1 # iteration counter
+    N = 3 # number of past iterations to include in convergence criterion calculation
+    er = 0 # initialize error
+    τ = 0.001 # convergence parameter (upper bound of error)
+    comps = zeros(N-1)
 
-    solver = FEASolver(Direct, problem; xmin=1e-6, penalty=TopOpt.PowerPenalty(3.0)) # instancing of FEA solver
+    # iterate until convergence
+    while τ > er
 
-    #######   Optimization subproblem and update
+        @show mean(solver.vars)
+        solver()
+        
+        m = JuMP.Model(minlp_solver)
+        comp = Compliance(FEAparams.problem, solver)
+        filter = DensityFilter(solver; rmin=3.0)
+        obj = x -> comp(filter(x))
+        
+        count != 1 && (sensPast = copy(sensNew))
+        # Update sensitivities
+        # sensNew = ForwardDiff.gradient(obj, solver.vars)
+        # sensNew = ReverseDiff.gradient(obj, solver.vars)
+        println("grads")
+        sensNew = grad(central_fdm(2, 1), obj, solver.vars)[1]
+        count == 1 && (sensPast = copy(sensNew))
+        # Sensitivities history averaging
+        sensNew = (sensPast+sensNew)/2
+        
+        # linearized objective
+        # linObj = deltaX -> sensNew*deltaX
+        
+        # Volume constraint
+        # volfrac = TopOpt.Volume(problem, solver)
+        # volConstr = x -> volfrac(filter(x)) - FEAparams.V[1]
+        # linVolConstr = deltaX -> ForwardDiff.gradient(volConstr, zeros(nels))*deltaX # linearized constraint
+        
+        # https://www.juliaopt.org/packages/
+        println("setup model")
+        # Define optimization variables (change in each pseudo-density for this iteration)
+        @variable(m, deltaX[1:numVars], Int)
+        [@constraint(m, deltaX[k] ∈ [-solver.vars[k] 1-solver.vars[k]]) for k ∈ 1:numVars]
+        # Constrain volume of structure
+        @constraint(m, volfrac(filter(solver.vars+deltaX)) <= VF)
+        # Constrain volume change per iteration
+        @constraint(m, sum(deltaX) <= β*nels)
+        # @constraint(m, ForwardDiff.gradient(volfrac(filter(solver.vars+deltaX)), solver.vars)*deltaX)
+        @objective(m, Min, deltaX -> sensNew*deltaX)
+        # Optimize linearized problem
+        println("optimize")
+        optimize!(m)
+        println("optimize done")
+        # Perform step (update pseudo-densities)
+        solver.vars += JuMP.value.(deltaX)
+        # Store recent history of objectives
+        [comps[i] = comps[i+1] for i ∈ 1:length(comps)-1]
+        comps[end] = JuMP.objective_value(m)
+        
+        #   Convergence check
+        #=
+            convergence criterion
+            k = 10
+            N = 5
+            ((10-5) + (9-4) + (8-3) + (7-2) + (6-1)) / (10+9+8+7+6)
+            k > 2*N - 1
+        =#
+        if count > 2*N - 1
+            global er = abs(sum([comps[end-i+1] - comps[end-N-i+1] for i in 1:N]))/sum([comps[end-i+1] for i in 1:N])
+        end
+      
+        print("$count    comps: ")
+        [print("$(round(comps[f];digits=3)) ") for f in 1:length(comps)]
+        print("er = $(round(er;digits=4))   ")
+        @show mean(solver.vars)
 
-    comp = Compliance(problem, solver)
-    filter = DensityFilter(solver; rmin=3.0)
-    obj = x -> comp(filter(x))
+        global count += 1
+        
+    end
+# end
 
-    #######   Sensitivities history averaging
-
-    sensNew = ForwardDiff.gradient(obj, solver.vars)
-    sensNew = (sensPast+sensNew)/2
-
-    # linearized objective
-    linObj = deltaX -> sensNew*deltaX
-
-    # Volume constraint
-    volfrac = TopOpt.Volume(problem, solver)
-    volConstr = x -> volfrac(filter(x)) - FEAparams.V[1]
-    linVolConstr = deltaX -> ForwardDiff.gradient(volConstr, zeros(nels))*deltaX # linearized constraint
-
-    # https://www.juliaopt.org/packages/
-    # pajarito?
-
-    #######   Convergence check
-
-
-end
+# TOBS(FEAparams, 0.7)
