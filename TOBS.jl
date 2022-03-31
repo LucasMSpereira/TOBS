@@ -1,8 +1,7 @@
-using TopOpt, Parameters, Makie, FiniteDifferences, Ipopt, Juniper, JuMP, Statistics, Ferrite
+using TopOpt, Parameters, Makie, Zygote, Cbc, Juniper, JuMP, Statistics, Ferrite
 using TopOpt.TopOptProblems.InputOutput.INP.Parser: InpContent
 import GLMakie, Plots
 include("./utils.jl")
-# Nonconvex.NonconvexCore.show_residuals[] = true
 
 @with_kw mutable struct FEAparameters
     meshSize::Tuple{Int, Int} = (70, 30) # Size of rectangular mesh
@@ -11,7 +10,6 @@ include("./utils.jl")
 end
 
 FEAparams = FEAparameters()
-nels = prod(FEAparams.meshSize)
 
 #
 
@@ -73,69 +71,69 @@ nels = prod(FEAparams.meshSize)
 
 #
 
-# function TOBS(FEAparams, VF)
-    VF = 0.7
-    nl_solver = optimizer_with_attributes(Ipopt.Optimizer, "print_level"=>1)
-    minlp_solver = optimizer_with_attributes(Juniper.Optimizer, "nl_solver"=>nl_solver)
+function TOBS(FEAparams, VF)
+    milp_solver = optimizer_with_attributes(Cbc.Optimizer)
     solver = FEASolver(Direct, FEAparams.problem; xmin=1e-6, penalty=TopOpt.PowerPenalty(3.0)) # instancing of FEA solver
+    solver.vars .= 1
     numVars = length(solver.vars)
-    @show numVars
-    β = 0.05 # parameter that limits volume change per iteration
+    β = 1 # parameter that limits volume change per iteration
     count = 1 # iteration counter
     N = 3 # number of past iterations to include in convergence criterion calculation
-    er = 0 # initialize error
+    er = 1 # initialize error
     τ = 0.001 # convergence parameter (upper bound of error)
     comps = zeros(N-1)
+    ϵ = 0.01
+    x = ones(numVars)
+
+    comp = Compliance(FEAparams.problem, solver)
+    filter = DensityFilter(solver; rmin=3.0)
+    obj = x -> comp(filter(x))
+    volfrac = TopOpt.Volume(FEAparams.problem, solver)
+    currentVF = volfrac(filter(x))
 
     # iterate until convergence
-    while τ > er
+    while τ < er
 
-        @show mean(solver.vars)
         solver()
         
-        m = JuMP.Model(minlp_solver)
-        comp = Compliance(FEAparams.problem, solver)
-        filter = DensityFilter(solver; rmin=3.0)
-        obj = x -> comp(filter(x))
-        
+        m = JuMP.Model(milp_solver)
+        set_optimizer_attribute(m, "logLevel", 1)
+
         count != 1 && (sensPast = copy(sensNew))
         # Update sensitivities
-        # sensNew = ForwardDiff.gradient(obj, solver.vars)
-        # sensNew = ReverseDiff.gradient(obj, solver.vars)
-        println("grads")
-        sensNew = grad(central_fdm(2, 1), obj, solver.vars)[1]
+        global sensNew = Zygote.gradient(obj, x)[1]
+        gradVF = Zygote.gradient(x -> volfrac(filter(x)), x)[1]
         count == 1 && (sensPast = copy(sensNew))
         # Sensitivities history averaging
-        sensNew = (sensPast+sensNew)/2
-        
-        # linearized objective
-        # linObj = deltaX -> sensNew*deltaX
-        
-        # Volume constraint
-        # volfrac = TopOpt.Volume(problem, solver)
-        # volConstr = x -> volfrac(filter(x)) - FEAparams.V[1]
-        # linVolConstr = deltaX -> ForwardDiff.gradient(volConstr, zeros(nels))*deltaX # linearized constraint
+        global sensNew = (sensPast+sensNew)/2
         
         # https://www.juliaopt.org/packages/
-        println("setup model")
         # Define optimization variables (change in each pseudo-density for this iteration)
         @variable(m, deltaX[1:numVars], Int)
-        [@constraint(m, deltaX[k] ∈ [-solver.vars[k] 1-solver.vars[k]]) for k ∈ 1:numVars]
+        set_lower_bound.(deltaX,-x)
+        set_upper_bound.(deltaX,1 .- x)
         # Constrain volume of structure
-        @constraint(m, volfrac(filter(solver.vars+deltaX)) <= VF)
+        @constraint(m, currentVF+gradVF'*deltaX <= VF)
         # Constrain volume change per iteration
-        @constraint(m, sum(deltaX) <= β*nels)
-        # @constraint(m, ForwardDiff.gradient(volfrac(filter(solver.vars+deltaX)), solver.vars)*deltaX)
-        @objective(m, Min, deltaX -> sensNew*deltaX)
+        @constraint(m, sum(deltaX) <= β*numVars)
+        # Constraint relaxation
+        if VF < (1-ϵ)*currentVF
+            ΔV = -ϵ*currentVF
+        elseif VF > (1+ϵ)*currentVF
+            ΔV = ϵ*currentVF
+        else
+            ΔV = VF - currentVF
+        end
+        @constraint(m, gradVF'*deltaX <= ΔV)
+        # Define optimization objective
+        @objective(m, Min, sensNew'*deltaX)
         # Optimize linearized problem
-        println("optimize")
         optimize!(m)
-        println("optimize done")
         # Perform step (update pseudo-densities)
-        solver.vars += JuMP.value.(deltaX)
+        x += JuMP.value.(deltaX)
         # Store recent history of objectives
         [comps[i] = comps[i+1] for i ∈ 1:length(comps)-1]
-        comps[end] = JuMP.objective_value(m)
+        comps[end] = obj(x)
         
         #   Convergence check
         #=
@@ -146,17 +144,20 @@ nels = prod(FEAparams.meshSize)
             k > 2*N - 1
         =#
         if count > 2*N - 1
-            global er = abs(sum([comps[end-i+1] - comps[end-N-i+1] for i in 1:N]))/sum([comps[end-i+1] for i in 1:N])
+            er = abs(sum([comps[end-i+1] - comps[end-N-i+1] for i in 1:N]))/sum([comps[end-i+1] for i in 1:N])
+            println(abs(sum([comps[end-i+1] - comps[end-N-i+1] for i in 1:N]))/sum([comps[end-i+1] for i in 1:N]))
         end
-      
+        
         print("$count    comps: ")
         [print("$(round(comps[f];digits=3)) ") for f in 1:length(comps)]
         print("er = $(round(er;digits=4))   ")
-        @show mean(solver.vars)
+        @show mean(x)
 
-        global count += 1
+        currentVF = volfrac(filter(x))
+
+        count += 1
         
     end
-# end
+end
 
-# TOBS(FEAparams, 0.7)
+TOBS(FEAparams, 0.7)
