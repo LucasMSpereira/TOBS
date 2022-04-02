@@ -77,7 +77,10 @@ function TOBS(FEAparams, VF)
     N = 5 # number of past iterations to include in convergence criterion calculation
     er = 1 # initialize error
     τ = 0.0001 # convergence parameter (upper bound of error)
-    comps = zeros(N)
+    comps = zeros(N) # recent history of compliance values
+    fullComps = zeros(10_000) # full history of compliance. used for plotting after TO
+    fullVF = zeros(10_000) # full history of volume fraction. used for plotting after TO
+    fullError = zeros(10_000) # full history of volume fraction. used for plotting after TO
     ϵ = 0.01
     x = ones(numVars)
 
@@ -87,10 +90,11 @@ function TOBS(FEAparams, VF)
     volfrac = TopOpt.Volume(FEAparams.problem, solver)
     constr = x -> volfrac(filter(x))
     currentVF = volfrac(filter(x))
+    m = JuMP.Model(milp_solver)
 
     # iterate until convergence
-    while τ < er && currentVF > VF
-        m = JuMP.Model(milp_solver)
+    while τ < er || currentVF > VF
+        count > 1 && (m = JuMP.Model(milp_solver))
         set_optimizer_attribute(m, "logLevel", 0)
         set_optimizer_attribute(m, "seconds", 1)
 
@@ -126,14 +130,30 @@ function TOBS(FEAparams, VF)
         x += JuMP.value.(deltaX)
         # Store recent history of objectives
         comps[1:end-1] .= comps[2:end]
-        comps[end] = obj(x)
+        currentComp = obj(x)
+        comps[end] = currentComp
         if count > 2 * N - 1
             er = abs(sum([comps[i] - comps[i - 1] for i in 2:N])) / sum(comps)
         end
         currentVF = volfrac(filter(x))
-        @info "iter = $count, comps = $(round.(comps; digits=3)), vol_frac = $(round(currentVF, digits=3)), er = $(round(er, digits=3))"
+        
+        # store full histories for plotting
+        if count <= 1e4
+            fullVF[count] = currentVF
+            fullComps[count] = currentComp
+            fullError[count] = er
+        else
+            vcat(fullVF, [currentVF])
+            vcat(fullComps, [currentComp])
+            vcat(fullError, [er])
+        end
+
+        @info "iter = $count, obj = $(round.(comps[end]; digits=3)), vol_frac = $(round(currentVF, digits=3)), er = $(round(er, digits=3))"
         count += 1        
     end
+    return m, x, fullVF[1:count-1], fullComps[1:count-1], Base.filter(x->x!=1.0, fullError[1:count-1])
 end
 
-TOBS(FEAparams, 0.5)
+@time model, dens, VFhist, compHist, errorHist = TOBS(FEAparams, 0.6)
+
+plotData(dens, FEAparams.meshSize, VFhist, compHist, errorHist)

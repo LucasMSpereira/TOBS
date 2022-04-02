@@ -14,8 +14,8 @@ function loadPos(nels, dispBC, FEAparams, grid)
   # Randomize positions again if that's the case
   while true
     if dispBC[1,3] > 3
-
-
+      
+      
       if dispBC[1,3] == 4
         # left
         if prod([loadPoss[i][2] != 1 for i in keys(loadPoss)])
@@ -51,11 +51,11 @@ function loadPos(nels, dispBC, FEAparams, grid)
       else
         println("\nProblem with dispBC\n")
       end
-
-
+      
+      
     else
-
-
+      
+      
       global boolPos = true
       for i in keys(loadPoss)
         global boolPos *= !in([loadPoss[i][k] for k in 1:2], [dispBC[h,1:2] for h in 1:size(dispBC)[1]])
@@ -66,16 +66,16 @@ function loadPos(nels, dispBC, FEAparams, grid)
         global loadElements = randDiffInt(2, nels)
         global loadPoss = findall(x->in(x, loadElements), FEAparams.elementIDmatrix)
       end
-
-
+      
+      
     end
   end
   # Generate point load component values
   randLoads = (-ones(length(loadElements),2) + 2*rand(length(loadElements),2))*90
   # Build matrix with positions and components of forces
   forces = [
-    loadPoss[1][1] loadPoss[1][2] randLoads[1,1] randLoads[1,2]
-    loadPoss[2][1] loadPoss[2][2] randLoads[2,1] randLoads[2,2]
+  loadPoss[1][1] loadPoss[1][2] randLoads[1,1] randLoads[1,2]
+  loadPoss[2][1] loadPoss[2][2] randLoads[2,1] randLoads[2,2]
   ]
   # Get vector with IDs of loaded nodes
   myCells = [grid.cells[g].nodes for g in loadElements]
@@ -112,7 +112,7 @@ function quad(nelx,nely,vec)
   # nelx = number of elements along x axis (number of columns in matrix)
   # nely = number of elements along y axis (number of lines in matrix)
   # vec = vector of scalars, each one associated to an element.
-    # this vector is already ordered according to element IDs
+  # this vector is already ordered according to element IDs
   global quadd=zeros(nely,nelx)
   for i in 1:nely
     for j in 1:nelx
@@ -184,4 +184,25 @@ function simplePins!(type, dispBC, FEAparams)
     nodeSet = Dict("supps" => [n for n in ((FEAparams.meshSize[1]+1)*(FEAparams.meshSize[2]-1)+1):((FEAparams.meshSize[1]+1)*((FEAparams.meshSize[2]+1)))])
   end
   return nodeSet, dispBC
+end
+
+function plotData(dens, meshSize, fullVF, fullComps, fullError)
+  fig = Figure(resolution = (1200, 600));
+  display(fig)
+  colSize = 500
+  # labels
+  Label(fig[1, 1], "Topology", textsize = 20)
+  colsize!(fig.layout, 1, Fixed(colSize))
+  Label(fig[1, 2], "VF history", textsize = 20)
+  colsize!(fig.layout, 2, Fixed(colSize))
+  Label(fig[3, 1], "Objective history", textsize = 20)
+  Label(fig[3, 2], "Error history", textsize = 20)
+  # plot topology
+  heatmap(fig[2,1], 1:meshSize[1], meshSize[2]:-1:1, quad(meshSize..., dens)')
+  # plot history of VF
+  lines(fig[2,2], 1:length(fullVF), fullVF)
+  # plot history of compliances
+  lines(fig[4,1], 1:length(fullComps), fullComps)
+  # plot history of error
+  lines(fig[4,2], 1:length(fullError), fullError)
 end
